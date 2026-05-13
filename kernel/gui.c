@@ -23,6 +23,9 @@
 #define GUI_TERM_MAX_LINES 32
 #define GUI_TERM_LINE_LEN  96
 #define GUI_TERM_INPUT_LEN 96
+#define GUI_CURSOR_W       16
+#define GUI_CURSOR_H       16
+#define GUI_DOUBLE_CLICK_TSC_LIMIT 1000000000ULL
 
 static void gui_draw_context_menu(void);
 static void gui_open_context_menu(void);
@@ -38,14 +41,24 @@ static void gui_desktop_open_selected_app(void);
 static void gui_mouse_left_pressed(int32_t x, int32_t y);
 static void gui_mouse_left_released(int32_t x, int32_t y);
 static void gui_move_active_window(int dx, int dy);
-
+static void gui_save_cursor_background(int32_t x, int32_t y);
+static void gui_restore_cursor_background(int32_t x, int32_t y);
+static void gui_mouse_process_buttons_and_drag(int32_t x, int32_t y, uint8_t left, uint8_t right);
+static void gui_open_context_menu(void);
 
 static int32_t gui_mouse_x = 100;
 static int32_t gui_mouse_y = 100;
 static int32_t gui_mouse_old_x = 100;
 static int32_t gui_mouse_old_y = 100;
-static int32_t gui_drag_last_x = 0;
-static int32_t gui_drag_last_y = 0;
+static int32_t gui_drag_mouse_start_x = 0;
+static int32_t gui_drag_mouse_start_y = 0;
+static int32_t gui_drag_window_start_x = 0;
+static int32_t gui_drag_window_start_y = 0;
+static int32_t gui_drag_outline_x = 0;
+static int32_t gui_drag_outline_y = 0;
+static int32_t gui_last_click_x = 0;
+static int32_t gui_last_click_y = 0;
+static int32_t gui_last_click_item = -1;
 
 static uint32_t desktop_selected_icon = 0;
 static uint32_t gui_width = 320;
@@ -54,12 +67,17 @@ static uint32_t gui_pitch = 320;
 static uint32_t gui_bpp = 8;
 static uint32_t gui_term_input_pos = 0;
 static uint32_t gui_term_line_count = 0;
+static uint32_t gui_cursor_backup[GUI_CURSOR_W * GUI_CURSOR_H];
+
+static uint64_t gui_last_click_time = 0;
 
 static uint8_t* gui_fb_addr = (uint8_t*)0xA0000;
 static uint8_t gui_using_framebuffer = 0;
 static uint8_t gui_mouse_right_prev = 0;
 static uint8_t gui_dragging_window = 0;
 static uint8_t gui_mouse_left_prev = 0;
+static uint8_t gui_cursor_backup_valid = 0;
+static uint8_t gui_drag_outline_visible = 0;
 
 static char gui_term_input[GUI_TERM_INPUT_LEN];
 static char gui_term_lines[GUI_TERM_MAX_LINES][GUI_TERM_LINE_LEN];
@@ -143,38 +161,19 @@ static void gui_draw_cursor(int32_t x, int32_t y) {
 
 void gui_mouse_moved(int32_t x, int32_t y, uint8_t left, uint8_t right) {
     /*
-       Borramos cursor anterior.
+       1. Restaurar exactamente lo que había debajo del cursor anterior.
     */
-    gui_restore_desktop_region(gui_mouse_old_x - 4, gui_mouse_old_y - 4, 24, 24);
+    gui_restore_cursor_background(gui_mouse_old_x, gui_mouse_old_y);
 
     /*
-       Detectar click izquierdo recién pulsado.
+       2. Procesar click/drag.
+       Esto está en otra función porque active_window está definido más abajo.
     */
-    if (left && !gui_mouse_left_prev) {
-        gui_mouse_left_pressed(x, y);
-    }
+    gui_mouse_process_buttons_and_drag(x, y, left, right);
 
     /*
-       Detectar soltar click izquierdo.
+       3. Actualizar posición del cursor.
     */
-    if (!left && gui_mouse_left_prev) {
-        gui_mouse_left_released(x, y);
-    }
-
-    /*
-       Arrastrar ventana si estamos manteniendo click en la barra.
-    */
-    if (left && gui_dragging_window) {
-        int dx = x - gui_drag_last_x;
-        int dy = y - gui_drag_last_y;
-
-        if (dx != 0 || dy != 0) {
-            gui_move_active_window(dx, dy);
-            gui_drag_last_x = x;
-            gui_drag_last_y = y;
-        }
-    }
-
     gui_mouse_x = x;
     gui_mouse_y = y;
 
@@ -182,12 +181,15 @@ void gui_mouse_moved(int32_t x, int32_t y, uint8_t left, uint8_t right) {
     gui_mouse_right_prev = right;
 
     /*
-       Dibujar cursor nuevo.
+       4. Guardar fondo bajo el cursor nuevo y dibujarlo.
     */
+    gui_save_cursor_background(gui_mouse_x, gui_mouse_y);
     gui_draw_cursor(gui_mouse_x, gui_mouse_y);
 
     gui_mouse_old_x = gui_mouse_x;
     gui_mouse_old_y = gui_mouse_y;
+
+    (void)right;
 }
 
 static const uint8_t g_320x200x256[] = {
@@ -650,6 +652,59 @@ static void gui_icon_draw(fs_node_t* node, uint32_t x, uint32_t y, uint8_t selec
     }
 }
 
+static uint32_t gui_read_raw_pixel(uint32_t x, uint32_t y) {
+    if (!gui_fb_addr || x >= gui_get_width() || y >= gui_get_height()) {
+        return 0;
+    }
+
+    if (gui_bpp == 32) {
+        uint32_t* pixel = (uint32_t*)(gui_fb_addr + y * gui_pitch + x * 4);
+        return *pixel;
+    }
+
+    if (gui_bpp == 24) {
+        uint8_t* pixel = gui_fb_addr + y * gui_pitch + x * 3;
+
+        uint32_t b = pixel[0];
+        uint32_t g = pixel[1];
+        uint32_t r = pixel[2];
+
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    /*
+       Fallback VGA 8-bit.
+       Guardamos solo el indice de color.
+    */
+    return gui_fb_addr[y * gui_pitch + x];
+}
+
+static void gui_write_raw_pixel(uint32_t x, uint32_t y, uint32_t color) {
+    if (!gui_fb_addr || x >= gui_get_width() || y >= gui_get_height()) {
+        return;
+    }
+
+    if (gui_bpp == 32) {
+        uint32_t* pixel = (uint32_t*)(gui_fb_addr + y * gui_pitch + x * 4);
+        *pixel = color;
+        return;
+    }
+
+    if (gui_bpp == 24) {
+        uint8_t* pixel = gui_fb_addr + y * gui_pitch + x * 3;
+
+        pixel[0] = color & 0xFF;
+        pixel[1] = (color >> 8) & 0xFF;
+        pixel[2] = (color >> 16) & 0xFF;
+        return;
+    }
+
+    /*
+       Fallback VGA 8-bit.
+    */
+    gui_fb_addr[y * gui_pitch + x] = (uint8_t)color;
+}
+
 void gui_statusbar(const char* text) {
     gui_rect(0, VGA_HEIGHT - 16, VGA_WIDTH, 16, GUI_COLOR_STATUS);
     gui_draw_text(6, VGA_HEIGHT - 12, text, GUI_COLOR_TEXT_INV);
@@ -805,7 +860,8 @@ typedef struct {
 } desktop_window_t;
 
 static void gui_terminal_redraw_input_line(desktop_window_t* win);
-
+static void gui_draw_drag_outline(int32_t x, int32_t y, int32_t w, int32_t h);
+static void gui_clamp_window_position(int32_t* x, int32_t* y, int32_t w, int32_t h);
 static void gui_draw_file_preview_window(desktop_window_t* win);
 static void gui_draw_text_editor_window(desktop_window_t* win);
 static void gui_draw_terminal_window(desktop_window_t* win);
@@ -819,6 +875,15 @@ static uint32_t gui_files_window_max_visible(desktop_window_t* win);
 static void gui_files_window_adjust_scroll(desktop_window_t* win);
 static void gui_draw_file_explorer_window_row(desktop_window_t* win, uint32_t item_index);
 static void gui_close_active_window(void);
+static int gui_files_item_at_mouse(int32_t x, int32_t y);
+static void gui_files_mouse_right_click(int32_t x, int32_t y);
+static void gui_files_open_selected(void);
+static void gui_mouse_left_pressed(int32_t x, int32_t y);
+static void gui_mouse_left_released(int32_t x, int32_t y);
+static void gui_mouse_right_pressed(int32_t x, int32_t y);
+static uint32_t gui_mouse_click_counter = 0;
+static uint32_t gui_last_click_counter = 0;
+static uint64_t gui_read_tsc(void);
 
 static desktop_window_t active_window = {
     120, 100, 900, 600, "Window", DESKTOP_APP_NONE, 0
@@ -830,6 +895,15 @@ uint32_t gui_get_width(void) {
 
 uint32_t gui_get_height(void) {
     return gui_height;
+}
+
+static uint64_t gui_read_tsc(void) {
+    uint32_t low;
+    uint32_t high;
+
+    __asm__ volatile ("rdtsc" : "=a"(low), "=d"(high));
+
+    return ((uint64_t)high << 32) | low;
 }
 
 static void gui_draw_desktop_background_region(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
@@ -1083,6 +1157,27 @@ static void gui_open_file_explorer(void) {
     gui_draw_file_explorer();
 }
 
+static void gui_files_open_selected(void) {
+    fs_node_t* selected = fs_get_child_at(gui_explorer_dir, gui_explorer_selected);
+
+    if (!selected) {
+        return;
+    }
+
+    if (selected->type == FS_DIR) {
+        gui_explorer_dir = selected;
+        gui_explorer_selected = 0;
+        gui_explorer_scroll = 0;
+
+        gui_draw_desktop_window(&active_window);
+    } else {
+        gui_preview_file = selected;
+        gui_screen = GUI_SCREEN_FILE_PREVIEW;
+
+        gui_draw_desktop_window(&active_window);
+    }
+}
+
 static void gui_files_handle_key(char c) {
     uint32_t count = fs_count_children(gui_explorer_dir);
 
@@ -1111,6 +1206,10 @@ static void gui_files_handle_key(char c) {
     }
 
 else if (c == '\n') {
+    gui_files_open_selected();
+}
+
+/* else if (c == '\n') {
     fs_node_t* selected = fs_get_child_at(gui_explorer_dir, gui_explorer_selected);
 
         if (!selected) {
@@ -1126,6 +1225,7 @@ else if (c == '\n') {
             gui_open_file_preview(selected);
         }
     }
+        */
 
     else if (c == '\b') {
         if (gui_explorer_dir && gui_explorer_dir->parent && gui_explorer_dir != fs_get_root()) {
@@ -1145,6 +1245,115 @@ else if (c == ' ') {
         gui_redraw_desktop();
         gui_statusbar("Returned to desktop menu");
     }
+}
+
+static int gui_files_item_at_mouse(int32_t x, int32_t y) {
+    if (!active_window.visible || active_window.app != DESKTOP_APP_FILES) {
+        return -1;
+    }
+
+    /*
+       No queremos seleccionar cuando estamos en preview/editor/context menu.
+       Solo en vista normal de archivos.
+    */
+    if (gui_screen != GUI_SCREEN_FILES && gui_screen != GUI_SCREEN_DESKTOP) {
+        return -1;
+    }
+
+    int32_t list_x = active_window.x + 28;
+    int32_t list_y = active_window.y + 92;
+    int32_t list_w = active_window.w - 56;
+    int32_t row_h = 26;
+
+    if (x < list_x || x >= list_x + list_w) {
+        return -1;
+    }
+
+    if (y < list_y) {
+        return -1;
+    }
+
+    int32_t local_y = y - list_y;
+    int32_t row = local_y / row_h;
+
+    if (row < 0) {
+        return -1;
+    }
+
+    uint32_t max_visible = 0;
+
+    if (active_window.h > 160) {
+        max_visible = (active_window.h - 150) / row_h;
+    }
+
+    if (max_visible == 0) {
+        max_visible = 1;
+    }
+
+    if ((uint32_t)row >= max_visible) {
+        return -1;
+    }
+
+    uint32_t index = gui_explorer_scroll + (uint32_t)row;
+    uint32_t count = fs_count_children(gui_explorer_dir);
+
+    if (index >= count) {
+        return -1;
+    }
+
+    return (int)index;
+}
+
+static void gui_files_mouse_left_click(int32_t x, int32_t y) {
+    int index = gui_files_item_at_mouse(x, y);
+
+    if (index < 0) {
+        return;
+    }
+
+    uint32_t old_selected = gui_explorer_selected;
+    gui_explorer_selected = (uint32_t)index;
+
+    if (old_selected != gui_explorer_selected) {
+        gui_draw_desktop_window(&active_window);
+    }
+
+    uint64_t now = gui_read_tsc();
+
+    int32_t dx = x - gui_last_click_x;
+    int32_t dy = y - gui_last_click_y;
+
+    int same_item = gui_last_click_item == index;
+    int close_position = dx > -8 && dx < 8 && dy > -8 && dy < 8;
+    int fast_enough = gui_last_click_time != 0 &&
+                      (now - gui_last_click_time) < GUI_DOUBLE_CLICK_TSC_LIMIT;
+
+    if (same_item && close_position && fast_enough) {
+        gui_last_click_time = 0;
+        gui_last_click_item = -1;
+
+        gui_files_open_selected();
+        return;
+    }
+
+    gui_last_click_time = now;
+    gui_last_click_x = x;
+    gui_last_click_y = y;
+    gui_last_click_item = index;
+}
+
+static void gui_files_mouse_right_click(int32_t x, int32_t y) {
+    int index = gui_files_item_at_mouse(x, y);
+
+    if (index >= 0) {
+        gui_explorer_selected = (uint32_t)index;
+        gui_draw_desktop_window(&active_window);
+    }
+
+    /*
+       Igual que pulsar Space en el explorer.
+    */
+    gui_open_context_menu();
 }
 
 static void gui_draw_file_preview_window(desktop_window_t* win) {
@@ -3399,22 +3608,164 @@ else if (c == '\n') {
 
 }
 
+static void gui_save_cursor_background(int32_t x, int32_t y) {
+    for (uint32_t cy = 0; cy < GUI_CURSOR_H; cy++) {
+        for (uint32_t cx = 0; cx < GUI_CURSOR_W; cx++) {
+            int32_t px = x + (int32_t)cx;
+            int32_t py = y + (int32_t)cy;
+
+            if (px >= 0 && py >= 0 &&
+                px < (int32_t)gui_get_width() &&
+                py < (int32_t)gui_get_height()) {
+                gui_cursor_backup[cy * GUI_CURSOR_W + cx] =
+                    gui_read_raw_pixel((uint32_t)px, (uint32_t)py);
+            } else {
+                gui_cursor_backup[cy * GUI_CURSOR_W + cx] = 0;
+            }
+        }
+    }
+
+    gui_cursor_backup_valid = 1;
+}
+
+static void gui_restore_cursor_background(int32_t x, int32_t y) {
+    if (!gui_cursor_backup_valid) {
+        return;
+    }
+
+    for (uint32_t cy = 0; cy < GUI_CURSOR_H; cy++) {
+        for (uint32_t cx = 0; cx < GUI_CURSOR_W; cx++) {
+            int32_t px = x + (int32_t)cx;
+            int32_t py = y + (int32_t)cy;
+
+            if (px >= 0 && py >= 0 &&
+                px < (int32_t)gui_get_width() &&
+                py < (int32_t)gui_get_height()) {
+                gui_write_raw_pixel(
+                    (uint32_t)px,
+                    (uint32_t)py,
+                    gui_cursor_backup[cy * GUI_CURSOR_W + cx]
+                );
+            }
+        }
+    }
+}
+
+static void gui_xor_pixel(int32_t x, int32_t y) {
+    if (x < 0 || y < 0) {
+        return;
+    }
+
+    if (x >= (int32_t)gui_get_width() || y >= (int32_t)gui_get_height()) {
+        return;
+    }
+
+    uint32_t color = gui_read_raw_pixel((uint32_t)x, (uint32_t)y);
+
+    /*
+       Invierte RGB pero mantiene alpha si existe.
+       En framebuffer 32-bit se ve como línea contrastada.
+    */
+    color ^= 0x00FFFFFF;
+
+    gui_write_raw_pixel((uint32_t)x, (uint32_t)y, color);
+}
+
+static void gui_draw_drag_outline(int32_t x, int32_t y, int32_t w, int32_t h) {
+    /*
+       Contorno punteado. Al llamarlo dos veces sobre la misma posición,
+       se borra automáticamente por XOR.
+    */
+
+    for (int32_t xx = 0; xx < w; xx += 6) {
+        gui_xor_pixel(x + xx, y);
+        gui_xor_pixel(x + xx + 1, y);
+
+        gui_xor_pixel(x + xx, y + h - 1);
+        gui_xor_pixel(x + xx + 1, y + h - 1);
+    }
+
+    for (int32_t yy = 0; yy < h; yy += 6) {
+        gui_xor_pixel(x, y + yy);
+        gui_xor_pixel(x, y + yy + 1);
+
+        gui_xor_pixel(x + w - 1, y + yy);
+        gui_xor_pixel(x + w - 1, y + yy + 1);
+    }
+}
+
+static void gui_clamp_window_position(int32_t* x, int32_t* y, int32_t w, int32_t h) {
+    if (*x < 0) {
+        *x = 0;
+    }
+
+    if (*y < 42) {
+        *y = 42;
+    }
+
+    if (*x + w > (int32_t)gui_get_width()) {
+        *x = (int32_t)gui_get_width() - w;
+    }
+
+    if (*y + h > (int32_t)gui_get_height() - 48) {
+        *y = (int32_t)gui_get_height() - 48 - h;
+    }
+
+    if (*x < 0) {
+        *x = 0;
+    }
+
+    if (*y < 42) {
+        *y = 42;
+    }
+}
+
 static void gui_mouse_left_pressed(int32_t x, int32_t y) {
+    gui_mouse_click_counter++;
+
+/*
+   Si la ventana Files está abierta y el click cae dentro del área de lista,
+   seleccionamos o abrimos con doble click.
+*/
+if (active_window.visible && active_window.app == DESKTOP_APP_FILES) {
+    int item = gui_files_item_at_mouse(x, y);
+
+    if (item >= 0) {
+        gui_files_mouse_left_click(x, y);
+        return;
+    }
+}
     /*
        Si hay una ventana visible y haces click en su barra superior,
-       empezamos a arrastrarla.
+       empezamos drag con outline.
     */
     if (active_window.visible) {
         if (gui_point_in_rect(x, y, active_window.x, active_window.y, active_window.w, 32)) {
             gui_dragging_window = 1;
-            gui_drag_last_x = x;
-            gui_drag_last_y = y;
+
+            gui_drag_mouse_start_x = x;
+            gui_drag_mouse_start_y = y;
+
+            gui_drag_window_start_x = active_window.x;
+            gui_drag_window_start_y = active_window.y;
+
+            gui_drag_outline_x = active_window.x;
+            gui_drag_outline_y = active_window.y;
+
+            gui_draw_drag_outline(
+                gui_drag_outline_x,
+                gui_drag_outline_y,
+                active_window.w,
+                active_window.h
+            );
+
+            gui_drag_outline_visible = 1;
             return;
         }
     }
 
     /*
-       Si no estás sobre la barra de una ventana, probamos iconos del escritorio.
+       Click en iconos del escritorio.
     */
     int icon = gui_desktop_icon_at(x, y);
 
@@ -3431,14 +3782,195 @@ static void gui_mouse_left_pressed(int32_t x, int32_t y) {
     }
 }
 
+static void gui_mouse_right_pressed(int32_t x, int32_t y) {
+    if (
+        active_window.visible &&
+        active_window.app == DESKTOP_APP_FILES &&
+        (gui_screen == GUI_SCREEN_FILES || gui_screen == GUI_SCREEN_DESKTOP)
+    ) {
+        int index = gui_files_item_at_mouse(x, y);
+
+        if (index >= 0) {
+            gui_explorer_selected = (uint32_t)index;
+            gui_draw_desktop_window(&active_window);
+        }
+
+        gui_open_context_menu();
+        return;
+    }
+}
+
 static void gui_mouse_left_released(int32_t x, int32_t y) {
     (void)x;
     (void)y;
 
+    if (!gui_dragging_window) {
+        return;
+    }
+
+    /*
+       Borrar el outline final.
+    */
+    if (gui_drag_outline_visible) {
+        gui_draw_drag_outline(
+            gui_drag_outline_x,
+            gui_drag_outline_y,
+            active_window.w,
+            active_window.h
+        );
+
+        gui_drag_outline_visible = 0;
+    }
+
+    /*
+       Guardamos zona vieja de la ventana real.
+    */
+    int old_x = active_window.x;
+    int old_y = active_window.y;
+    int old_w = active_window.w;
+    int old_h = active_window.h;
+
+    /*
+       Movemos la ventana real a la posición final.
+    */
+    active_window.x = gui_drag_outline_x;
+    active_window.y = gui_drag_outline_y;
+
+    /*
+       Restauramos zona antigua y dibujamos una sola vez.
+    */
+    gui_restore_desktop_region(old_x - 2, old_y - 2, old_w + 4, old_h + 4);
+    gui_draw_desktop_window(&active_window);
+
     gui_dragging_window = 0;
 }
 
+static void gui_mouse_process_buttons_and_drag(int32_t x, int32_t y, uint8_t left, uint8_t right) {
+    if (left && !gui_mouse_left_prev) {
+        gui_mouse_left_pressed(x, y);
+    }
+
+    if (right && !gui_mouse_right_prev) {
+        gui_mouse_right_pressed(x, y);
+    }
+
+    if (left && gui_dragging_window) {
+        int32_t new_x = gui_drag_window_start_x + (x - gui_drag_mouse_start_x);
+        int32_t new_y = gui_drag_window_start_y + (y - gui_drag_mouse_start_y);
+
+        gui_clamp_window_position(&new_x, &new_y, active_window.w, active_window.h);
+
+        if (new_x != gui_drag_outline_x || new_y != gui_drag_outline_y) {
+            if (gui_drag_outline_visible) {
+                gui_draw_drag_outline(
+                    gui_drag_outline_x,
+                    gui_drag_outline_y,
+                    active_window.w,
+                    active_window.h
+                );
+            }
+
+            gui_drag_outline_x = new_x;
+            gui_drag_outline_y = new_y;
+
+            gui_draw_drag_outline(
+                gui_drag_outline_x,
+                gui_drag_outline_y,
+                active_window.w,
+                active_window.h
+            );
+
+            gui_drag_outline_visible = 1;
+        }
+    }
+
+    if (!left && gui_mouse_left_prev) {
+        gui_mouse_left_released(x, y);
+    }
+
+    (void)right;
+}
+
+/*
+static void gui_mouse_process_buttons_and_drag(int32_t x, int32_t y, uint8_t left, uint8_t right) {
+
+    if (left && !gui_mouse_left_prev) {
+        gui_mouse_left_pressed(x, y);
+    }
+
+    if (right && !gui_mouse_right_prev) {
+    gui_mouse_right_pressed(x, y);
+}
+
+if (right && !gui_mouse_right_prev) {
+if (
+    active_window.visible &&
+    active_window.app == DESKTOP_APP_FILES &&
+    gui_screen == GUI_SCREEN_FILES
+) {
+    int item = gui_files_item_at_mouse(x, y);
+
+    if (item >= 0) {
+        gui_files_mouse_left_click(x, y);
+        return;
+    }
+}
+}
+
+
+
+    if (left && gui_dragging_window) {
+        int32_t new_x = gui_drag_window_start_x + (x - gui_drag_mouse_start_x);
+        int32_t new_y = gui_drag_window_start_y + (y - gui_drag_mouse_start_y);
+
+        gui_clamp_window_position(&new_x, &new_y, active_window.w, active_window.h);
+
+        if (new_x != gui_drag_outline_x || new_y != gui_drag_outline_y) {
+            if (gui_drag_outline_visible) {
+                gui_draw_drag_outline(
+                    gui_drag_outline_x,
+                    gui_drag_outline_y,
+                    active_window.w,
+                    active_window.h
+                );
+            }
+
+            gui_drag_outline_x = new_x;
+            gui_drag_outline_y = new_y;
+
+            gui_draw_drag_outline(
+                gui_drag_outline_x,
+                gui_drag_outline_y,
+                active_window.w,
+                active_window.h
+            );
+
+            gui_drag_outline_visible = 1;
+        }
+    }
+    if (!left && gui_mouse_left_prev) {
+        gui_mouse_left_released(x, y);
+    }
+
+    (void)right;
+}
+*/
+
 static void gui_desktop_open_selected_app(void) {
+    int old_visible = active_window.visible;
+    int old_x = active_window.x;
+    int old_y = active_window.y;
+    int old_w = active_window.w;
+    int old_h = active_window.h;
+
+    /*
+       Si había una ventana abierta, borramos solo esa zona.
+    */
+    if (old_visible) {
+        active_window.visible = 0;
+        gui_restore_desktop_region(old_x - 2, old_y - 2, old_w + 4, old_h + 4);
+    }
+
     active_window.visible = 1;
 
     if (desktop_selected_icon == 0) {
@@ -3451,23 +3983,28 @@ static void gui_desktop_open_selected_app(void) {
 
         gui_explorer_dir = fs_get_root();
         gui_explorer_selected = 0;
+
+        /*
+           Deja esta línea solo si tu código tiene gui_explorer_scroll.
+           Si no existe, bórrala.
+        */
         gui_explorer_scroll = 0;
     }
 
-else if (desktop_selected_icon == 1) {
-    active_window.x = 320;
-    active_window.y = 180;
-    active_window.w = 1200;
-    active_window.h = 650;
-    active_window.title = "Terminal";
-    active_window.app = DESKTOP_APP_TERMINAL;
+    else if (desktop_selected_icon == 1) {
+        active_window.x = 320;
+        active_window.y = 180;
+        active_window.w = 1200;
+        active_window.h = 650;
+        active_window.title = "Terminal";
+        active_window.app = DESKTOP_APP_TERMINAL;
 
-    gui_term_clear_buffer();
-    gui_term_clear_input();
+        gui_term_clear_buffer();
+        gui_term_clear_input();
 
-    gui_term_add_line("Bionic graphical terminal");
-    gui_term_add_line("Type help for commands");
-}
+        gui_term_add_line("Bionic graphical terminal");
+        gui_term_add_line("Type help for commands");
+    }
 
     else if (desktop_selected_icon == 2) {
         active_window.x = 420;
@@ -3478,5 +4015,8 @@ else if (desktop_selected_icon == 1) {
         active_window.app = DESKTOP_APP_INFO;
     }
 
-    gui_redraw_desktop();
+    /*
+       Dibujamos solo la ventana, no todo el escritorio.
+    */
+    gui_draw_desktop_window(&active_window);
 }

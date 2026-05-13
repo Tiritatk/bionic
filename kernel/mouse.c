@@ -121,8 +121,8 @@ void mouse_handle_interrupt(void) {
     int32_t dx = (int8_t)mouse_packet[1];
     int32_t dy = (int8_t)mouse_packet[2];
 
-    left_button = mouse_packet[0] & 0x01;
-    right_button = mouse_packet[0] & 0x02;
+left_button = (mouse_packet[0] & 0x01) ? 1 : 0;
+right_button = (mouse_packet[0] & 0x02) ? 1 : 0;
 
     mouse_x += dx;
     mouse_y -= dy;
