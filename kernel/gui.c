@@ -4,6 +4,8 @@
 #include "../include/fs.h"
 #include "../include/io.h"
 #include "../include/input.h"
+#include "../include/bionic_logo.h"
+#include "../include/gui_icons.h"
 
 #define VGA_WIDTH  gui_width
 #define VGA_HEIGHT gui_height
@@ -26,6 +28,8 @@
 #define GUI_CURSOR_W       16
 #define GUI_CURSOR_H       16
 #define GUI_DOUBLE_CLICK_TSC_LIMIT 1000000000ULL
+// #define BIONIC_LOGO_W 128
+// #define BIONIC_LOGO_H 128
 
 static void gui_draw_context_menu(void);
 static void gui_open_context_menu(void);
@@ -37,7 +41,6 @@ static void gui_new_folder_handle_key(char c);
 static void gui_delete_selected_item(void);
 static void gui_restore_desktop_region(int x, int y, int w, int h);
 static void gui_desktop_open_selected_app(void);
-static void gui_desktop_open_selected_app(void);
 static void gui_mouse_left_pressed(int32_t x, int32_t y);
 static void gui_mouse_left_released(int32_t x, int32_t y);
 static void gui_move_active_window(int dx, int dy);
@@ -45,6 +48,7 @@ static void gui_save_cursor_background(int32_t x, int32_t y);
 static void gui_restore_cursor_background(int32_t x, int32_t y);
 static void gui_mouse_process_buttons_and_drag(int32_t x, int32_t y, uint8_t left, uint8_t right);
 static void gui_open_context_menu(void);
+static uint8_t gui_booting = 0;
 
 static int32_t gui_mouse_x = 100;
 static int32_t gui_mouse_y = 100;
@@ -160,6 +164,10 @@ static void gui_draw_cursor(int32_t x, int32_t y) {
 }
 
 void gui_mouse_moved(int32_t x, int32_t y, uint8_t left, uint8_t right) {
+    if (gui_booting) {
+        return;
+    }
+
     /*
        1. Restaurar exactamente lo que había debajo del cursor anterior.
     */
@@ -810,7 +818,7 @@ static void gui_editor_save(void);
 static void gui_draw_desktop_background(void);
 static void gui_draw_taskbar(void);
 static void gui_desktop_hint(const char* text);
-
+static void gui_boot_animation(void);
 static void gui_desktop_icon_files(uint32_t x, uint32_t y, uint8_t selected);
 static void gui_desktop_icon_terminal(uint32_t x, uint32_t y, uint8_t selected);
 static void gui_desktop_icon_info(uint32_t x, uint32_t y, uint8_t selected);
@@ -854,9 +862,18 @@ typedef struct {
     int y;
     int w;
     int h;
+
+    int restore_x;
+    int restore_y;
+    int restore_w;
+    int restore_h;
+
     const char* title;
     desktop_app_t app;
+
     int visible;
+    int minimized;
+    int maximized;
 } desktop_window_t;
 
 static void gui_terminal_redraw_input_line(desktop_window_t* win);
@@ -884,9 +901,17 @@ static void gui_mouse_right_pressed(int32_t x, int32_t y);
 static uint32_t gui_mouse_click_counter = 0;
 static uint32_t gui_last_click_counter = 0;
 static uint64_t gui_read_tsc(void);
+static void gui_draw_rgba_image(int32_t x, int32_t y, uint32_t w, uint32_t h, const uint32_t* pixels);
+static void gui_draw_rgba_image_scaled(int32_t x, int32_t y, uint32_t draw_w, uint32_t draw_h, uint32_t src_w, uint32_t src_h, const uint32_t* pixels);
 
 static desktop_window_t active_window = {
-    120, 100, 900, 600, "Window", DESKTOP_APP_NONE, 0
+    120, 100, 900, 600,
+    120, 100, 900, 600,
+    "Window",
+    DESKTOP_APP_NONE,
+    0,
+    0,
+    0
 };
 
 uint32_t gui_get_width(void) {
@@ -1035,6 +1060,8 @@ void gui_demo(void) {
 
     gui_explorer_dir = fs_get_root();
     gui_explorer_selected = 0;
+
+    gui_boot_animation();
 
     gui_redraw_desktop();
 }
@@ -2393,6 +2420,34 @@ static void gui_draw_file_explorer_window(desktop_window_t* win) {
     gui_draw_text(content_x + 16, win->y + win->h - 28, "W/S move  Enter open  Backspace up  Space menu", 8);
 }
 
+static void gui_draw_window_controls(desktop_window_t* win) {
+    if (!win || !win->visible) {
+        return;
+    }
+
+    int bx = win->x + win->w - 96;
+    int by = win->y + 7;
+
+    /* Minimizar */
+    gui_rect(bx, by, 24, 18, 7);
+    gui_rect_border(bx, by, 24, 18, 0);
+    gui_draw_text(bx + 8, by + 5, "-", 0);
+
+    /* Maximizar / restaurar */
+    gui_rect(bx + 32, by, 24, 18, 7);
+    gui_rect_border(bx + 32, by, 24, 18, 0);
+
+    if (win->maximized) {
+        gui_draw_text(bx + 37, by + 5, "[]", 0);
+    } else {
+        gui_draw_text(bx + 37, by + 5, "[]", 0);
+    }
+
+    /* Cerrar */
+    gui_rect(bx + 64, by, 24, 18, 12);
+    gui_rect_border(bx + 64, by, 24, 18, 0);
+    gui_draw_text(bx + 72, by + 5, "X", 15);
+}
 
 static void gui_draw_desktop_window(desktop_window_t* win) {
     if (!win || !win->visible) {
@@ -2404,12 +2459,7 @@ static void gui_draw_desktop_window(desktop_window_t* win) {
 
     gui_rect(win->x, win->y, win->w, 32, 9);
     gui_draw_text(win->x + 12, win->y + 12, win->title, 15);
-
-    /*
-       Botón cerrar decorativo.
-    */
-    gui_rect(win->x + win->w - 32, win->y + 8, 16, 16, 12);
-    gui_rect_border(win->x + win->w - 32, win->y + 8, 16, 16, 15);
+    gui_draw_window_controls(win);
 
     if (win->app == DESKTOP_APP_FILES) {
         if (gui_screen == GUI_SCREEN_FILE_PREVIEW) {
@@ -2430,6 +2480,297 @@ else if (win->app == DESKTOP_APP_TERMINAL) {
         gui_draw_text(win->x + 24, win->y + 82, "1920x1080 framebuffer", 0);
         gui_draw_text(win->x + 24, win->y + 106, "RAMFS + GUI enabled", 0);
     }
+}
+
+static void gui_fake_delay(uint32_t amount) {
+    volatile uint32_t i;
+
+    for (i = 0; i < amount; i++) {
+        __asm__ volatile ("nop");
+    }
+}
+
+static void gui_draw_bionic_boot_logo(uint32_t cx, uint32_t cy) {
+    /*
+       Logo simple provisional:
+       un núcleo circular/cuadrado con pequeñas conexiones.
+       Luego lo podemos sustituir por tu icono real convertido a array.
+    */
+
+    uint32_t logo_color = 15;
+    uint32_t accent = 11;
+    uint32_t shadow = 8;
+
+    /* sombra */
+    gui_rect(cx - 46, cy - 46, 92, 92, shadow);
+
+    /* cuerpo */
+    gui_rect(cx - 50, cy - 50, 92, 92, logo_color);
+    gui_rect_border(cx - 50, cy - 50, 92, 92, accent);
+
+    /* centro */
+    gui_rect(cx - 22, cy - 22, 36, 36, accent);
+    gui_rect_border(cx - 22, cy - 22, 36, 36, 0);
+
+    /* conexiones */
+    gui_rect(cx - 70, cy - 6, 20, 8, accent);
+    gui_rect(cx + 42, cy - 6, 20, 8, accent);
+    gui_rect(cx - 6, cy - 70, 8, 20, accent);
+    gui_rect(cx - 6, cy + 42, 8, 20, accent);
+
+    /* detalle interior */
+    gui_rect(cx - 12, cy - 12, 16, 16, 15);
+}
+
+static void gui_draw_rgba_image(int32_t x, int32_t y,
+                                uint32_t w, uint32_t h,
+                                const uint32_t* pixels) {
+    for (uint32_t iy = 0; iy < h; iy++) {
+        for (uint32_t ix = 0; ix < w; ix++) {
+            int32_t px = x + (int32_t)ix;
+            int32_t py = y + (int32_t)iy;
+
+            if (px < 0 || py < 0 ||
+                px >= (int32_t)gui_get_width() ||
+                py >= (int32_t)gui_get_height()) {
+                continue;
+            }
+
+            uint32_t src = pixels[iy * w + ix];
+
+            uint8_t a = (src >> 24) & 0xFF;
+            uint8_t r = (src >> 16) & 0xFF;
+            uint8_t g = (src >> 8)  & 0xFF;
+            uint8_t b = src & 0xFF;
+
+            if (a == 0) {
+                continue;
+            }
+
+            if (a == 255) {
+                gui_write_raw_pixel((uint32_t)px, (uint32_t)py, src);
+                continue;
+            }
+
+            uint32_t dst = gui_read_raw_pixel((uint32_t)px, (uint32_t)py);
+
+            uint8_t dr = (dst >> 16) & 0xFF;
+            uint8_t dg = (dst >> 8)  & 0xFF;
+            uint8_t db = dst & 0xFF;
+
+            uint8_t out_r = (uint8_t)((r * a + dr * (255 - a)) / 255);
+            uint8_t out_g = (uint8_t)((g * a + dg * (255 - a)) / 255);
+            uint8_t out_b = (uint8_t)((b * a + db * (255 - a)) / 255);
+
+            uint32_t out = 0xFF000000 |
+                           (out_r << 16) |
+                           (out_g << 8)  |
+                           out_b;
+
+            gui_write_raw_pixel((uint32_t)px, (uint32_t)py, out);
+        }
+    }
+}
+
+static void gui_draw_rgba_image_scaled(int32_t x, int32_t y,
+                                       uint32_t draw_w, uint32_t draw_h,
+                                       uint32_t src_w, uint32_t src_h,
+                                       const uint32_t* pixels) {
+    for (uint32_t dy = 0; dy < draw_h; dy++) {
+        uint32_t sy = (dy * src_h) / draw_h;
+
+        for (uint32_t dx = 0; dx < draw_w; dx++) {
+            uint32_t sx = (dx * src_w) / draw_w;
+
+            int32_t px = x + (int32_t)dx;
+            int32_t py = y + (int32_t)dy;
+
+            if (px < 0 || py < 0 ||
+                px >= (int32_t)gui_get_width() ||
+                py >= (int32_t)gui_get_height()) {
+                continue;
+            }
+
+            uint32_t src = pixels[sy * src_w + sx];
+
+            uint8_t a = (src >> 24) & 0xFF;
+            uint8_t r = (src >> 16) & 0xFF;
+            uint8_t g = (src >> 8)  & 0xFF;
+            uint8_t b = src & 0xFF;
+
+            if (a == 0) {
+                continue;
+            }
+
+            if (a == 255) {
+                gui_write_raw_pixel((uint32_t)px, (uint32_t)py, src);
+                continue;
+            }
+
+            uint32_t dst = gui_read_raw_pixel((uint32_t)px, (uint32_t)py);
+
+            uint8_t dr = (dst >> 16) & 0xFF;
+            uint8_t dg = (dst >> 8)  & 0xFF;
+            uint8_t db = dst & 0xFF;
+
+            uint8_t out_r = (uint8_t)((r * a + dr * (255 - a)) / 255);
+            uint8_t out_g = (uint8_t)((g * a + dg * (255 - a)) / 255);
+            uint8_t out_b = (uint8_t)((b * a + db * (255 - a)) / 255);
+
+            uint32_t out = 0xFF000000 |
+                           (out_r << 16) |
+                           (out_g << 8) |
+                           out_b;
+
+            gui_write_raw_pixel((uint32_t)px, (uint32_t)py, out);
+        }
+    }
+}
+
+static void gui_boot_animation(void) {
+    gui_booting = 1;
+
+    uint32_t w = gui_get_width();
+    uint32_t h = gui_get_height();
+
+    uint32_t center_x = w / 2;
+    uint32_t center_y = h / 2 - 20;
+
+    gui_clear(0);
+
+uint32_t logo_draw_w = 180;
+uint32_t logo_draw_h = 180;
+
+gui_draw_rgba_image_scaled(
+    (int32_t)(center_x - logo_draw_w / 2),
+    (int32_t)(center_y - logo_draw_h / 2),
+    logo_draw_w,
+    logo_draw_h,
+    BIONIC_LOGO_W,
+    BIONIC_LOGO_H,
+    bionic_logo
+);
+
+    // gui_draw_text(center_x - 28, center_y + 150, "BIONIC", 15);
+    // gui_draw_text(center_x - 112, center_y + 174, "EXPERIMENTAL OS FROM SCRATCH", 7);
+
+    uint32_t bar_w = 300;
+    uint32_t bar_h = 18;
+    uint32_t bar_x = center_x - bar_w / 2;
+    uint32_t bar_y = center_y + 130;
+
+    gui_rect(bar_x, bar_y, bar_w, bar_h, 0);
+    gui_rect_border(bar_x, bar_y, bar_w, bar_h, 15);
+
+    for (uint32_t p = 0; p <= 100; p += 2) {
+        uint32_t fill_w = ((bar_w - 4) * p) / 100;
+
+        gui_rect(bar_x + 2, bar_y + 2, fill_w, bar_h - 4, 15);
+        gui_fake_delay(9000000);
+    }
+
+    gui_fake_delay(30000000);
+
+    gui_booting = 0;
+}
+
+static int gui_window_control_at(desktop_window_t* win, int32_t x, int32_t y) {
+    if (!win || !win->visible) {
+        return 0;
+    }
+
+    int bx = win->x + win->w - 96;
+    int by = win->y + 7;
+
+    if (gui_point_in_rect(x, y, bx, by, 24, 18)) {
+        return 1; /* minimizar */
+    }
+
+    if (gui_point_in_rect(x, y, bx + 32, by, 24, 18)) {
+        return 2; /* maximizar/restaurar */
+    }
+
+    if (gui_point_in_rect(x, y, bx + 64, by, 24, 18)) {
+        return 3; /* cerrar */
+    }
+
+    return 0;
+}
+
+static void gui_window_close(desktop_window_t* win) {
+    if (!win || !win->visible) {
+        return;
+    }
+
+    int old_x = win->x;
+    int old_y = win->y;
+    int old_w = win->w;
+    int old_h = win->h;
+
+    win->visible = 0;
+    win->minimized = 0;
+    win->maximized = 0;
+    win->app = DESKTOP_APP_NONE;
+
+    gui_restore_desktop_region(old_x - 2, old_y - 2, old_w + 4, old_h + 4);
+    gui_draw_taskbar();
+}
+
+static void gui_window_toggle_maximize(desktop_window_t* win) {
+    if (!win || !win->visible) {
+        return;
+    }
+
+    int old_x = win->x;
+    int old_y = win->y;
+    int old_w = win->w;
+    int old_h = win->h;
+
+    gui_restore_desktop_region(old_x - 2, old_y - 2, old_w + 4, old_h + 4);
+
+    if (!win->maximized) {
+        win->restore_x = win->x;
+        win->restore_y = win->y;
+        win->restore_w = win->w;
+        win->restore_h = win->h;
+
+        win->x = 40;
+        win->y = 60;
+        win->w = (int)gui_get_width() - 80;
+        win->h = (int)gui_get_height() - 130;
+
+        win->maximized = 1;
+    } else {
+        win->x = win->restore_x;
+        win->y = win->restore_y;
+        win->w = win->restore_w;
+        win->h = win->restore_h;
+
+        win->maximized = 0;
+    }
+
+    win->visible = 1;
+    win->minimized = 0;
+
+    gui_draw_desktop_window(win);
+    gui_draw_taskbar();
+}
+
+static void gui_window_minimize(desktop_window_t* win) {
+    if (!win || !win->visible) {
+        return;
+    }
+
+    int old_x = win->x;
+    int old_y = win->y;
+    int old_w = win->w;
+    int old_h = win->h;
+
+    win->visible = 0;
+    win->minimized = 1;
+
+    gui_restore_desktop_region(old_x - 2, old_y - 2, old_w + 4, old_h + 4);
+    gui_draw_taskbar();
 }
 
 static void gui_draw_context_menu(void) {
@@ -3723,6 +4064,25 @@ static void gui_clamp_window_position(int32_t* x, int32_t* y, int32_t w, int32_t
 static void gui_mouse_left_pressed(int32_t x, int32_t y) {
     gui_mouse_click_counter++;
 
+    if (active_window.visible) {
+    int control = gui_window_control_at(&active_window, x, y);
+
+    if (control == 1) {
+        gui_window_minimize(&active_window);
+        return;
+    }
+
+    if (control == 2) {
+        gui_window_toggle_maximize(&active_window);
+        return;
+    }
+
+    if (control == 3) {
+        gui_window_close(&active_window);
+        return;
+    }
+}
+
 /*
    Si la ventana Files está abierta y el click cae dentro del área de lista,
    seleccionamos o abrimos con doble click.
@@ -3739,30 +4099,30 @@ if (active_window.visible && active_window.app == DESKTOP_APP_FILES) {
        Si hay una ventana visible y haces click en su barra superior,
        empezamos drag con outline.
     */
-    if (active_window.visible) {
-        if (gui_point_in_rect(x, y, active_window.x, active_window.y, active_window.w, 32)) {
-            gui_dragging_window = 1;
+if (active_window.visible && !active_window.maximized) {
+    if (gui_point_in_rect(x, y, active_window.x, active_window.y, active_window.w, 32)) {
+        gui_dragging_window = 1;
 
-            gui_drag_mouse_start_x = x;
-            gui_drag_mouse_start_y = y;
+        gui_drag_mouse_start_x = x;
+        gui_drag_mouse_start_y = y;
 
-            gui_drag_window_start_x = active_window.x;
-            gui_drag_window_start_y = active_window.y;
+        gui_drag_window_start_x = active_window.x;
+        gui_drag_window_start_y = active_window.y;
 
-            gui_drag_outline_x = active_window.x;
-            gui_drag_outline_y = active_window.y;
+        gui_drag_outline_x = active_window.x;
+        gui_drag_outline_y = active_window.y;
 
-            gui_draw_drag_outline(
-                gui_drag_outline_x,
-                gui_drag_outline_y,
-                active_window.w,
-                active_window.h
-            );
+        gui_draw_drag_outline(
+            gui_drag_outline_x,
+            gui_drag_outline_y,
+            active_window.w,
+            active_window.h
+        );
 
-            gui_drag_outline_visible = 1;
-            return;
-        }
+        gui_drag_outline_visible = 1;
+        return;
     }
+}
 
     /*
        Click en iconos del escritorio.
@@ -4019,4 +4379,12 @@ static void gui_desktop_open_selected_app(void) {
        Dibujamos solo la ventana, no todo el escritorio.
     */
     gui_draw_desktop_window(&active_window);
+
+    active_window.restore_x = active_window.x;
+    active_window.restore_y = active_window.y;
+    active_window.restore_w = active_window.w;
+    active_window.restore_h = active_window.h;
+
+    active_window.minimized = 0;
+    active_window.maximized = 0;
 }
