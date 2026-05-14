@@ -1,7 +1,8 @@
 # Bionic OS
 
 <p align="center">
-  <img src="assets/bionic-logo.png" alt="Bionic OS Logo" width="180">
+<img width="1581" height="667" alt="aa" src="https://github.com/user-attachments/assets/3d4bcd2d-aff8-475d-a7fb-573fbff59331" />
+
 </p>
 
 <p align="center">
@@ -22,6 +23,7 @@
 **Bionic OS** is an experimental operating system built from scratch using **C and x86 Assembly**.
 
 The goal of Bionic is not to become a production-ready operating system, but to explore how an OS works internally: booting, memory management, filesystems, keyboard input, graphics, GUI systems, windows, and user interaction.
+
 
 It started as a simple text-mode kernel, but has evolved into a small graphical environment with a desktop, window system, RAM filesystem, graphical file explorer, terminal, text editor, and mouse support.
 
