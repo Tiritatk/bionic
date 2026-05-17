@@ -5,6 +5,7 @@
 #include "../include/fs.h"
 #include "../include/kmalloc.h"
 #include "../include/gui.h"
+#include "../include/ata.h"
 #define SHELL_BUFFER_SIZE 256
 
 static char    buffer[SHELL_BUFFER_SIZE];
@@ -395,6 +396,48 @@ else if (kstrcmp(cmd, "mv") == 0) {
             fs_mv(src, dst);
         }
     }
+}
+
+else if (kstrcmp(cmd, "diskinfo") == 0) {
+    if (ata_identify() == 0) {
+        kprintf("Disco ATA detectado\n");
+    } else {
+        kprintf("No se detecto disco ATA\n");
+    }
+}
+
+else if (kstrcmp(cmd, "disktest") == 0) {
+    uint8_t write_buf[ATA_SECTOR_SIZE];
+    uint8_t read_buf[ATA_SECTOR_SIZE];
+
+    for (uint32_t i = 0; i < ATA_SECTOR_SIZE; i++) {
+        write_buf[i] = 0;
+        read_buf[i] = 0;
+    }
+
+    const char* msg = "Bionic ATA test OK";
+
+    uint32_t i = 0;
+    while (msg[i]) {
+        write_buf[i] = msg[i];
+        i++;
+    }
+
+    /*
+       Usamos LBA 2048 para no tocar el inicio del disco.
+       En nuestro disco raw no pasa nada, pero es buena costumbre.
+    */
+    if (ata_write_sector(2048, write_buf) != 0) {
+        kprintf("Error escribiendo sector\n");
+        return;
+    }
+
+    if (ata_read_sector(2048, read_buf) != 0) {
+        kprintf("Error leyendo sector\n");
+        return;
+    }
+
+    kprintf("Leido del disco: %s\n", read_buf);
 }
 
 else if (kstrcmp(cmd, "cp") == 0) {

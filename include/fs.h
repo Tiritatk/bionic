@@ -48,4 +48,5 @@ void fs_set_current(fs_node_t* node);
 uint32_t fs_count_children(fs_node_t* dir);
 fs_node_t* fs_get_child_at(fs_node_t* dir, uint32_t index);
 fs_node_t* fs_get_node(const char* path);
+void fs_reset(void);
 #endif

@@ -11,6 +11,8 @@
 #include "../include/kmalloc.h"
 #include "../include/gui.h"
 #include "../include/mouse.h"
+#include "../include/ata.h"
+#include "../include/bionicfs.h"
 
 void kernel_main(uint32_t mb_magic, multiboot_info_t *mb) {
     gdt_init();
@@ -23,6 +25,13 @@ void kernel_main(uint32_t mb_magic, multiboot_info_t *mb) {
     pmm_init(mb);
     kmalloc_init();
     fs_init();
+    ata_init();
+
+    if (bionicfs_load() == 0) {
+    kprintf("BIONICFS: filesystem cargado desde disco\n");
+    } else {
+    kprintf("BIONICFS: no hay filesystem guardado\n");
+    }
 
     /* Mensajes con distintos colores */
     vga_puts_color("[OK] ", VGA_LIGHT_GREEN, VGA_BLACK);

@@ -272,6 +272,10 @@ void fs_init(void) {
 //    kprintf("RAMFS iniciado correctamente\n");
 }
 
+void fs_reset(void) {
+    fs_init();
+}
+
 void fs_print_current_path(void) {
     if (!fs_current || !fs_root) {
         kprintf("/");

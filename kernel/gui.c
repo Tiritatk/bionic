@@ -6,6 +6,8 @@
 #include "../include/input.h"
 #include "../include/bionic_logo.h"
 #include "../include/gui_icons.h"
+#include "../include/ata.h"
+#include "../include/bionicfs.h"
 
 #define VGA_WIDTH  gui_width
 #define VGA_HEIGHT gui_height
@@ -82,6 +84,7 @@ static uint8_t gui_dragging_window = 0;
 static uint8_t gui_mouse_left_prev = 0;
 static uint8_t gui_cursor_backup_valid = 0;
 static uint8_t gui_drag_outline_visible = 0;
+static uint8_t gui_autosave_enabled = 0;
 
 static char gui_term_input[GUI_TERM_INPUT_LEN];
 static char gui_term_lines[GUI_TERM_MAX_LINES][GUI_TERM_LINE_LEN];
@@ -903,6 +906,7 @@ static uint32_t gui_last_click_counter = 0;
 static uint64_t gui_read_tsc(void);
 static void gui_draw_rgba_image(int32_t x, int32_t y, uint32_t w, uint32_t h, const uint32_t* pixels);
 static void gui_draw_rgba_image_scaled(int32_t x, int32_t y, uint32_t draw_w, uint32_t draw_h, uint32_t src_w, uint32_t src_h, const uint32_t* pixels);
+static void gui_autosave_if_enabled(void);
 
 static desktop_window_t active_window = {
     120, 100, 900, 600,
@@ -1868,6 +1872,7 @@ static void gui_copy_from_input(void) {
     gui_build_destination_path(gui_input_buffer, dst_path, 192);
 
     fs_cp(src_path, dst_path);
+    gui_autosave_if_enabled();
 
     gui_transfer_target = 0;
     gui_screen = GUI_SCREEN_FILES;
@@ -1896,6 +1901,7 @@ static void gui_move_from_input(void) {
     gui_build_destination_path(gui_input_buffer, dst_path, 192);
 
     fs_mv(src_path, dst_path);
+    gui_autosave_if_enabled();
 
     gui_transfer_target = 0;
     gui_explorer_selected = 0;
@@ -1984,6 +1990,7 @@ static void gui_rename_from_input(void) {
     gui_build_node_path(gui_rename_target, old_path, 128);
 
     fs_rename(old_path, gui_input_buffer);
+    gui_autosave_if_enabled();
 
     gui_rename_target = 0;
     gui_screen = GUI_SCREEN_FILES;
@@ -2088,6 +2095,7 @@ static void gui_create_folder_from_input(void) {
     full_path[pos] = 0;
 
     fs_mkdir(full_path);
+    gui_autosave_if_enabled();
 
     gui_screen = GUI_SCREEN_FILES;
     gui_explorer_selected = 0;
@@ -2132,6 +2140,7 @@ static void gui_create_file_from_input(void) {
     full_path[pos] = 0;
 
     fs_touch(full_path);
+    gui_autosave_if_enabled();
 
     gui_screen = GUI_SCREEN_FILES;
     gui_explorer_selected = 0;
@@ -2170,6 +2179,7 @@ static void gui_delete_selected_item(void) {
     } else {
         fs_rm(path);
     }
+            gui_autosave_if_enabled();
 
     uint32_t new_count = fs_count_children(gui_explorer_dir);
 
@@ -2976,6 +2986,8 @@ static void gui_editor_save(void) {
 
     gui_editor_file->content[i] = 0;
     gui_editor_file->size = i;
+
+    gui_autosave_if_enabled();
 }
 
 static void gui_draw_text_editor_window(desktop_window_t* win) {
@@ -3547,6 +3559,88 @@ static void gui_draw_terminal_window(desktop_window_t* win) {
     gui_rect(content_x + 28 + gui_term_input_pos * 8, input_y, 7, 9, 15);
 }
 
+static void gui_u32_to_dec(uint32_t value, char* out, uint32_t max) {
+    if (!out || max == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < max; i++) {
+        out[i] = 0;
+    }
+
+    if (value == 0) {
+        if (max > 1) {
+            out[0] = '0';
+            out[1] = 0;
+        }
+        return;
+    }
+
+    char temp[16];
+
+    for (uint32_t i = 0; i < 16; i++) {
+        temp[i] = 0;
+    }
+
+    uint32_t pos = 0;
+
+    while (value > 0 && pos < 15) {
+        temp[pos++] = '0' + (value % 10);
+        value /= 10;
+    }
+
+    uint32_t out_pos = 0;
+
+    while (pos > 0 && out_pos < max - 1) {
+        pos--;
+        out[out_pos++] = temp[pos];
+    }
+
+    out[out_pos] = 0;
+}
+
+static void gui_term_add_label_u32_suffix(const char* label, uint32_t value, const char* suffix) {
+    char line[GUI_TERM_LINE_LEN];
+    char num[16];
+
+    for (uint32_t i = 0; i < GUI_TERM_LINE_LEN; i++) {
+        line[i] = 0;
+    }
+
+    gui_u32_to_dec(value, num, 16);
+
+    uint32_t pos = 0;
+    uint32_t i = 0;
+
+    while (label && label[i] && pos < GUI_TERM_LINE_LEN - 1) {
+        line[pos++] = label[i++];
+    }
+
+    i = 0;
+
+    while (num[i] && pos < GUI_TERM_LINE_LEN - 1) {
+        line[pos++] = num[i++];
+    }
+
+    i = 0;
+
+    while (suffix && suffix[i] && pos < GUI_TERM_LINE_LEN - 1) {
+        line[pos++] = suffix[i++];
+    }
+
+    line[pos] = 0;
+
+    gui_term_add_line(line);
+}
+
+static void gui_autosave_if_enabled(void) {
+    if (!gui_autosave_enabled) {
+        return;
+    }
+
+    bionicfs_save();
+}
+
 static void gui_terminal_execute_command(void) {
     if (gui_term_input[0] == '\0') {
         return;
@@ -3556,7 +3650,7 @@ static void gui_terminal_execute_command(void) {
 
     if (gui_term_streq(gui_term_input, "help")) {
         gui_term_add_line("Commands:");
-        gui_term_add_line("help clear pwd ls cd mkdir touch cat write rm tree exit");
+        gui_term_add_line("help, clear, pwd, ls, cd, mkdir, touch, cat, write, rm, tree, exit, diskinfo, disktest, savefs, loadfs, storageinfo, autosave on/off/status");
     }
 
     else if (gui_term_streq(gui_term_input, "clear")) {
@@ -3568,6 +3662,64 @@ static void gui_terminal_execute_command(void) {
         gui_build_node_path(fs_get_current(), path, 128);
         gui_term_add_line(path);
     }
+
+    else if (gui_term_streq(gui_term_input, "diskinfo")) {
+    if (ata_identify() == 0) {
+        gui_term_add_line("ATA disk detected");
+    } else {
+        gui_term_add_line("No ATA disk detected");
+    }
+}
+
+else if (gui_term_streq(gui_term_input, "disktest")) {
+    uint8_t write_buf[ATA_SECTOR_SIZE];
+    uint8_t read_buf[ATA_SECTOR_SIZE];
+
+    for (uint32_t i = 0; i < ATA_SECTOR_SIZE; i++) {
+        write_buf[i] = 0;
+        read_buf[i] = 0;
+    }
+
+    const char* msg = "Bionic ATA test OK";
+
+    uint32_t i = 0;
+    while (msg[i]) {
+        write_buf[i] = msg[i];
+        i++;
+    }
+
+    if (ata_write_sector(2048, write_buf) != 0) {
+        gui_term_add_line("Write sector failed");
+    }
+
+    else if (ata_read_sector(2048, read_buf) != 0) {
+        gui_term_add_line("Read sector failed");
+    }
+
+    else {
+        gui_term_add_line((const char*)read_buf);
+    }
+}
+
+    else if (gui_term_streq(gui_term_input, "savefs")) {
+    if (bionicfs_save() == 0) {
+        gui_term_add_line("Filesystem saved");
+    } else {
+        gui_term_add_line("savefs failed");
+    }
+}
+
+else if (gui_term_streq(gui_term_input, "loadfs")) {
+    if (bionicfs_load() == 0) {
+        gui_explorer_dir = fs_get_root();
+        gui_explorer_selected = 0;
+        gui_explorer_scroll = 0;
+
+        gui_term_add_line("Filesystem loaded");
+    } else {
+        gui_term_add_line("loadfs failed");
+    }
+}
 
     else if (gui_term_starts_with(gui_term_input, "cd ")) {
         const char* path = gui_term_input + 3;
@@ -3634,25 +3786,27 @@ static void gui_terminal_execute_command(void) {
         }
     }
 
-    else if (gui_term_starts_with(gui_term_input, "mkdir ")) {
-        const char* path = gui_term_input + 6;
+else if (gui_term_starts_with(gui_term_input, "mkdir ")) {
+    const char* path = gui_term_input + 6;
 
-        if (fs_mkdir(path) == 0) {
-            gui_term_add_line("Directory created");
-        } else {
-            gui_term_add_line("mkdir failed");
-        }
+    if (fs_mkdir(path) == 0) {
+        gui_term_add_line("Directory created");
+        gui_autosave_if_enabled();
+    } else {
+        gui_term_add_line("mkdir failed");
     }
+}
 
-    else if (gui_term_starts_with(gui_term_input, "touch ")) {
-        const char* path = gui_term_input + 6;
+else if (gui_term_starts_with(gui_term_input, "touch ")) {
+    const char* path = gui_term_input + 6;
 
-        if (fs_touch(path) == 0) {
-            gui_term_add_line("File created");
-        } else {
-            gui_term_add_line("touch failed");
-        }
+    if (fs_touch(path) == 0) {
+        gui_term_add_line("File created");
+        gui_autosave_if_enabled();
+    } else {
+        gui_term_add_line("touch failed");
     }
+}
 
     else if (gui_term_starts_with(gui_term_input, "cat ")) {
         const char* path = gui_term_input + 4;
@@ -3668,6 +3822,24 @@ static void gui_terminal_execute_command(void) {
             }
         }
     }
+
+        else if (gui_term_streq(gui_term_input, "autosave on")) {
+    gui_autosave_enabled = 1;
+    gui_term_add_line("Autosave enabled");
+}
+
+else if (gui_term_streq(gui_term_input, "autosave off")) {
+    gui_autosave_enabled = 0;
+    gui_term_add_line("Autosave disabled");
+}
+
+else if (gui_term_streq(gui_term_input, "autosave status")) {
+    if (gui_autosave_enabled) {
+        gui_term_add_line("Autosave: enabled");
+    } else {
+        gui_term_add_line("Autosave: disabled");
+    }
+}
 
     else if (gui_term_starts_with(gui_term_input, "write ")) {
         const char* rest = gui_term_input + 6;
@@ -3692,23 +3864,25 @@ static void gui_terminal_execute_command(void) {
 
             const char* text = rest + i + 1;
 
-            if (fs_write(path, text) == 0) {
-                gui_term_add_line("Written");
-            } else {
-                gui_term_add_line("write failed");
-            }
+if (fs_write(path, text) == 0) {
+    gui_term_add_line("Written");
+    gui_autosave_if_enabled();
+} else {
+    gui_term_add_line("write failed");
+}
         }
     }
 
-    else if (gui_term_starts_with(gui_term_input, "rm ")) {
-        const char* path = gui_term_input + 3;
+else if (gui_term_starts_with(gui_term_input, "rm ")) {
+    const char* path = gui_term_input + 3;
 
-        if (fs_rm(path) == 0) {
-            gui_term_add_line("Removed");
-        } else {
-            gui_term_add_line("rm failed");
-        }
+    if (fs_rm(path) == 0) {
+        gui_term_add_line("Removed");
+        gui_autosave_if_enabled();
+    } else {
+        gui_term_add_line("rm failed");
     }
+}
 
     else if (gui_term_streq(gui_term_input, "tree")) {
         gui_term_add_line("tree not available in GUI terminal yet");
@@ -3721,6 +3895,42 @@ static void gui_terminal_execute_command(void) {
         gui_term_clear_input();
         return;
     }
+
+    else if (gui_term_streq(gui_term_input, "storageinfo")) {
+    gui_term_add_line("=== Storage info ===");
+
+    if (ata_is_present()) {
+        gui_term_add_line("ATA disk: detected");
+
+        gui_term_add_label_u32_suffix("Disk size: ", ata_size_mb(), " MB");
+        gui_term_add_label_u32_suffix("Total sectors: ", ata_total_sectors(), "");
+        gui_term_add_label_u32_suffix("Sector size: ", ATA_SECTOR_SIZE, " bytes");
+    } else {
+        gui_term_add_line("ATA disk: not detected");
+    }
+
+    gui_term_add_line("");
+
+    gui_term_add_label_u32_suffix("BIONICFS start LBA: ", bionicfs_start_lba(), "");
+
+    uint32_t entries = 0;
+
+    if (bionicfs_probe(&entries) == 0) {
+        gui_term_add_line("BIONICFS: found");
+        gui_term_add_label_u32_suffix("Saved entries: ", entries, "");
+    } else {
+        gui_term_add_line("BIONICFS: not found");
+    }
+
+    gui_term_add_line("Persistence: manual save/load");
+    gui_term_add_line("Commands: savefs loadfs");
+
+    if (gui_autosave_enabled) {
+    gui_term_add_line("Autosave: enabled");
+} else {
+    gui_term_add_line("Autosave: disabled");
+}
+}
 
     else {
         gui_term_add_line("Unknown command");
