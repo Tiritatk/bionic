@@ -9,6 +9,7 @@
 #include "../include/ata.h"
 #include "../include/bionicfs.h"
 #include "../include/install.h"
+#include "../include/fat32.h"
 
 #define VGA_WIDTH  gui_width
 #define VGA_HEIGHT gui_height
@@ -3805,7 +3806,8 @@ static void gui_terminal_execute_command(void) {
     if (gui_term_streq(gui_term_input, "help")) {
         gui_term_add_line("Commands:");
         gui_term_add_line("help, clear, pwd, ls, cd, mkdir, touch, cat, write, rm, tree, exit, diskinfo");
-               gui_term_add_line("disktest, savefs, loadfs, storageinfo, autosave on/off/status, installinfo, installreset");
+        gui_term_add_line("disktest, savefs, loadfs, storageinfo, autosave on/off/status, installinfo, installreset");
+        gui_term_add_line("fatinfo, fatls, fatcat, fatimport");
     }
 
     else if (gui_term_streq(gui_term_input, "clear")) {
@@ -3818,6 +3820,120 @@ static void gui_terminal_execute_command(void) {
         gui_term_add_line(path);
     }
 
+    else if (gui_term_streq(gui_term_input, "fatls")) {
+    if (!fat32_is_mounted()) {
+        if (fat32_mount(ATA_DRIVE_SLAVE) != 0) {
+            gui_term_add_line("FAT32: not mounted");
+        } else {
+            gui_term_add_line("FAT32 mounted");
+        }
+    }
+
+    if (fat32_is_mounted()) {
+        if (fat32_list_root(gui_term_add_line) != 0) {
+            gui_term_add_line("fatls failed");
+        }
+    }
+}
+
+    else if (gui_term_streq(gui_term_input, "fatinfo")) {
+    if (fat32_mount(ATA_DRIVE_SLAVE) != 0) {
+        gui_term_add_line("FAT32: not detected on slave disk");
+    } else {
+        gui_term_add_line("=== FAT32 info ===");
+        gui_term_add_line("FAT32: detected");
+
+        gui_term_add_label_u32_suffix("Drive: ", fat32_drive(), "");
+        gui_term_add_label_u32_suffix("Bytes per sector: ", fat32_bytes_per_sector(), "");
+        gui_term_add_label_u32_suffix("Sectors per cluster: ", fat32_sectors_per_cluster(), "");
+        gui_term_add_label_u32_suffix("Reserved sectors: ", fat32_reserved_sectors(), "");
+        gui_term_add_label_u32_suffix("Number of FATs: ", fat32_num_fats(), "");
+        gui_term_add_label_u32_suffix("FAT size: ", fat32_fat_size(), " sectors");
+        gui_term_add_label_u32_suffix("Root cluster: ", fat32_root_cluster(), "");
+        gui_term_add_label_u32_suffix("FAT start LBA: ", fat32_fat_start_lba(), "");
+        gui_term_add_label_u32_suffix("Data start LBA: ", fat32_data_start_lba(), "");
+        gui_term_add_label_u32_suffix("Total sectors: ", fat32_total_sectors(), "");
+    }
+}
+
+else if (gui_term_starts_with(gui_term_input, "fatimport ")) {
+    const char* args = gui_term_input + 10;
+
+    /*
+       Formato:
+       fatimport FATFILE.TXT /destino/file.txt
+    */
+
+    uint32_t i = 0;
+
+    while (args[i] && args[i] != ' ') {
+        i++;
+    }
+
+    if (args[i] == '\0') {
+        gui_term_add_line("Usage: fatimport FATFILE /path/file");
+    } else {
+        char fat_name[64];
+        char ramfs_path[128];
+
+        for (uint32_t j = 0; j < 64; j++) {
+            fat_name[j] = 0;
+        }
+
+        for (uint32_t j = 0; j < 128; j++) {
+            ramfs_path[j] = 0;
+        }
+
+        for (uint32_t j = 0; j < i && j < 63; j++) {
+            fat_name[j] = args[j];
+        }
+
+        const char* dst = args + i + 1;
+
+        uint32_t j = 0;
+        while (dst[j] && j < 127) {
+            ramfs_path[j] = dst[j];
+            j++;
+        }
+
+        ramfs_path[j] = 0;
+
+        if (!fat32_is_mounted()) {
+            if (fat32_mount(ATA_DRIVE_SLAVE) != 0) {
+                gui_term_add_line("FAT32: not mounted");
+            } else {
+                gui_term_add_line("FAT32 mounted");
+            }
+        }
+
+        if (fat32_is_mounted()) {
+            if (fat32_import_root_file(fat_name, ramfs_path) == 0) {
+                gui_term_add_line("Imported from FAT32");
+
+                /*
+                   Si tienes autosave activado, guarda también en BIONICFS.
+                */
+                gui_autosave_if_enabled();
+
+                /*
+                   Si el explorer está abierto, lo mandamos a root para evitar
+                   punteros viejos raros.
+                */
+                gui_explorer_dir = fs_get_root();
+                gui_explorer_selected = 0;
+
+                /*
+                   Si tienes gui_explorer_scroll, deja esta línea.
+                   Si no existe, bórrala.
+                */
+                gui_explorer_scroll = 0;
+            } else {
+                gui_term_add_line("fatimport failed");
+            }
+        }
+    }
+}
+
     else if (gui_term_streq(gui_term_input, "diskinfo")) {
     if (ata_identify() == 0) {
         gui_term_add_line("ATA disk detected");
@@ -3825,6 +3941,24 @@ static void gui_terminal_execute_command(void) {
         gui_term_add_line("No ATA disk detected");
     }
     }
+
+        else if (gui_term_starts_with(gui_term_input, "fatcat ")) {
+    const char* filename = gui_term_input + 7;
+
+    if (!fat32_is_mounted()) {
+        if (fat32_mount(ATA_DRIVE_SLAVE) != 0) {
+            gui_term_add_line("FAT32: not mounted");
+        } else {
+            gui_term_add_line("FAT32 mounted");
+        }
+    }
+
+    if (fat32_is_mounted()) {
+        if (fat32_read_root_file(filename, gui_term_add_line) != 0) {
+            gui_term_add_line("fatcat failed or file not found");
+        }
+    }
+}
 
     else if (gui_term_streq(gui_term_input, "installinfo")) {
     if (install_config_exists()) {

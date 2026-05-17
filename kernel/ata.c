@@ -26,8 +26,8 @@
 #define ATA_SR_DRQ          0x08
 #define ATA_SR_ERR          0x01
 
-static uint8_t ata_present = 0;
-static uint32_t ata_sectors = 0;
+static uint8_t ata_present[2] = {0, 0};
+static uint32_t ata_sectors[2] = {0, 0};
 
 static void ata_io_wait(void) {
     /*
@@ -76,35 +76,49 @@ static int ata_wait_drq(void) {
 }
 
 void ata_init(void) {
-    ata_present = 0;
-    ata_sectors = 0;
+    ata_present[0] = 0;
+    ata_present[1] = 0;
+    ata_sectors[0] = 0;
+    ata_sectors[1] = 0;
 
-    if (ata_identify() == 0) {
-        ata_present = 1;
-        kprintf("ATA: disco detectado\n");
+    if (ata_identify_drive(ATA_DRIVE_MASTER) == 0) {
+        ata_present[ATA_DRIVE_MASTER] = 1;
+        kprintf("ATA: primary master detected\n");
     } else {
-        kprintf("ATA: no se detecto disco\n");
+        kprintf("ATA: primary master not detected\n");
+    }
+
+    if (ata_identify_drive(ATA_DRIVE_SLAVE) == 0) {
+        ata_present[ATA_DRIVE_SLAVE] = 1;
+        kprintf("ATA: primary slave detected\n");
+    } else {
+        kprintf("ATA: primary slave not detected\n");
     }
 }
 
 int ata_identify(void) {
-    /*
-       Seleccionar master drive.
-    */
-    outb(ATA_PRIMARY_IO + ATA_REG_HDDEVSEL, 0xA0);
-    ata_io_wait();
+    return ata_identify_drive(ATA_DRIVE_MASTER);
+}
+
+int ata_identify_drive(uint8_t drive) {
+    if (drive > 1) {
+        return -1;
+    }
 
     /*
-       Limpiar registros.
+       0xA0 = master
+       0xB0 = slave
     */
+    uint8_t drive_select = drive == ATA_DRIVE_MASTER ? 0xA0 : 0xB0;
+
+    outb(ATA_PRIMARY_IO + ATA_REG_HDDEVSEL, drive_select);
+    ata_io_wait();
+
     outb(ATA_PRIMARY_IO + ATA_REG_SECCOUNT0, 0);
     outb(ATA_PRIMARY_IO + ATA_REG_LBA0, 0);
     outb(ATA_PRIMARY_IO + ATA_REG_LBA1, 0);
     outb(ATA_PRIMARY_IO + ATA_REG_LBA2, 0);
 
-    /*
-       Enviar IDENTIFY.
-    */
     outb(ATA_PRIMARY_IO + ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
     ata_io_wait();
 
@@ -121,9 +135,6 @@ int ata_identify(void) {
     uint8_t lba1 = inb(ATA_PRIMARY_IO + ATA_REG_LBA1);
     uint8_t lba2 = inb(ATA_PRIMARY_IO + ATA_REG_LBA2);
 
-    /*
-       Si estos no son 0, probablemente no es ATA normal.
-    */
     if (lba1 != 0 || lba2 != 0) {
         return -1;
     }
@@ -132,26 +143,71 @@ int ata_identify(void) {
         return -1;
     }
 
-uint16_t identify[256];
+    uint16_t identify[256];
 
-for (uint32_t i = 0; i < 256; i++) {
-    identify[i] = inw(ATA_PRIMARY_IO + ATA_REG_DATA);
-}
+    for (uint32_t i = 0; i < 256; i++) {
+        identify[i] = inw(ATA_PRIMARY_IO + ATA_REG_DATA);
+    }
 
-/*
-   Words 60-61 = total LBA28 sectors.
-*/
-ata_sectors = ((uint32_t)identify[61] << 16) | identify[60];
+    ata_sectors[drive] = ((uint32_t)identify[61] << 16) | identify[60];
 
-return 0;
+    return 0;
 }
 
 int ata_read_sector(uint32_t lba, uint8_t* buffer) {
+    return ata_read_sector_drive(ATA_DRIVE_MASTER, lba, buffer);
+}
+
+int ata_write_sector(uint32_t lba, const uint8_t* buffer) {
+    return ata_write_sector_drive(ATA_DRIVE_MASTER, lba, buffer);
+}
+
+uint8_t ata_is_present(void) {
+    return ata_present[ATA_DRIVE_MASTER];
+}
+
+uint32_t ata_total_sectors(void) {
+    return ata_sectors[ATA_DRIVE_MASTER];
+}
+
+uint32_t ata_size_mb(void) {
+    return ata_sectors[ATA_DRIVE_MASTER] / 2048;
+}
+
+uint8_t ata_is_present_drive(uint8_t drive) {
+    if (drive > 1) {
+        return 0;
+    }
+
+    return ata_present[drive];
+}
+
+uint32_t ata_total_sectors_drive(uint8_t drive) {
+    if (drive > 1) {
+        return 0;
+    }
+
+    return ata_sectors[drive];
+}
+
+uint32_t ata_size_mb_drive(uint8_t drive) {
+    if (drive > 1) {
+        return 0;
+    }
+
+    return ata_sectors[drive] / 2048;
+}
+
+int ata_read_sector_drive(uint8_t drive, uint32_t lba, uint8_t* buffer) {
     if (!buffer) {
         return -1;
     }
 
-    if (!ata_present) {
+    if (drive > 1) {
+        return -1;
+    }
+
+    if (!ata_present[drive]) {
         return -1;
     }
 
@@ -159,11 +215,10 @@ int ata_read_sector(uint32_t lba, uint8_t* buffer) {
         return -1;
     }
 
-    /*
-       Modo LBA28, master.
-    */
+    uint8_t drive_bits = drive == ATA_DRIVE_MASTER ? 0xE0 : 0xF0;
+
     outb(ATA_PRIMARY_IO + ATA_REG_HDDEVSEL,
-         0xE0 | ((lba >> 24) & 0x0F));
+         drive_bits | ((lba >> 24) & 0x0F));
 
     outb(ATA_PRIMARY_IO + ATA_REG_SECCOUNT0, 1);
     outb(ATA_PRIMARY_IO + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
@@ -189,12 +244,16 @@ int ata_read_sector(uint32_t lba, uint8_t* buffer) {
     return 0;
 }
 
-int ata_write_sector(uint32_t lba, const uint8_t* buffer) {
+int ata_write_sector_drive(uint8_t drive, uint32_t lba, const uint8_t* buffer) {
     if (!buffer) {
         return -1;
     }
 
-    if (!ata_present) {
+    if (drive > 1) {
+        return -1;
+    }
+
+    if (!ata_present[drive]) {
         return -1;
     }
 
@@ -202,8 +261,10 @@ int ata_write_sector(uint32_t lba, const uint8_t* buffer) {
         return -1;
     }
 
+    uint8_t drive_bits = drive == ATA_DRIVE_MASTER ? 0xE0 : 0xF0;
+
     outb(ATA_PRIMARY_IO + ATA_REG_HDDEVSEL,
-         0xE0 | ((lba >> 24) & 0x0F));
+         drive_bits | ((lba >> 24) & 0x0F));
 
     outb(ATA_PRIMARY_IO + ATA_REG_SECCOUNT0, 1);
     outb(ATA_PRIMARY_IO + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
@@ -233,21 +294,4 @@ int ata_write_sector(uint32_t lba, const uint8_t* buffer) {
     }
 
     return 0;
-}
-
-uint8_t ata_is_present(void) {
-    return ata_present;
-}
-
-uint32_t ata_total_sectors(void) {
-    return ata_sectors;
-}
-
-uint32_t ata_size_mb(void) {
-    /*
-       1 sector = 512 bytes.
-       1 MiB = 1024 * 1024 bytes.
-       2048 sectores = 1 MiB.
-    */
-    return ata_sectors / 2048;
 }

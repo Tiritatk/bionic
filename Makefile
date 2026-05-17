@@ -13,7 +13,7 @@ OBJS = boot.o boot/gdt.o boot/idt.o boot/isr.o boot/irq.o \
        kernel/idt.o kernel/isr.o kernel/irq.o \
        kernel/keyboard.o kernel/mouse.o kernel/kprintf.o kernel/shell.o \
        kernel/pmm.o kernel/kmalloc.o kernel/fs.o kernel/gui.o \
-	   kernel/input.o kernel/ata.o kernel/bionicfs.o kernel/install.o
+	   kernel/input.o kernel/ata.o kernel/bionicfs.o kernel/install.o kernel/fat32.o
 
 all: myos.iso
 
