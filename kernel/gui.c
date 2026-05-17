@@ -8,6 +8,7 @@
 #include "../include/gui_icons.h"
 #include "../include/ata.h"
 #include "../include/bionicfs.h"
+#include "../include/install.h"
 
 #define VGA_WIDTH  gui_width
 #define VGA_HEIGHT gui_height
@@ -50,7 +51,11 @@ static void gui_save_cursor_background(int32_t x, int32_t y);
 static void gui_restore_cursor_background(int32_t x, int32_t y);
 static void gui_mouse_process_buttons_and_drag(int32_t x, int32_t y, uint8_t left, uint8_t right);
 static void gui_open_context_menu(void);
-static uint8_t gui_booting = 0;
+static void gui_setup_start(void);
+static void gui_draw_setup(void);
+static void gui_setup_handle_key(char c);
+static void gui_setup_apply(void);
+static void gui_redraw_desktop(void);
 
 static int32_t gui_mouse_x = 100;
 static int32_t gui_mouse_y = 100;
@@ -74,6 +79,7 @@ static uint32_t gui_bpp = 8;
 static uint32_t gui_term_input_pos = 0;
 static uint32_t gui_term_line_count = 0;
 static uint32_t gui_cursor_backup[GUI_CURSOR_W * GUI_CURSOR_H];
+static uint32_t gui_setup_selected = 0;
 
 static uint64_t gui_last_click_time = 0;
 
@@ -84,7 +90,9 @@ static uint8_t gui_dragging_window = 0;
 static uint8_t gui_mouse_left_prev = 0;
 static uint8_t gui_cursor_backup_valid = 0;
 static uint8_t gui_drag_outline_visible = 0;
-static uint8_t gui_autosave_enabled = 0;
+static uint8_t gui_autosave_enabled = 1;
+static uint8_t gui_setup_active = 0;
+static uint8_t gui_booting = 0;
 
 static char gui_term_input[GUI_TERM_INPUT_LEN];
 static char gui_term_lines[GUI_TERM_MAX_LINES][GUI_TERM_LINE_LEN];
@@ -773,6 +781,7 @@ static void gui_build_node_path(fs_node_t* node, char* out, uint32_t max) {
 
 typedef enum {
     GUI_SCREEN_DESKTOP,
+    GUI_SCREEN_SETUP,
     GUI_SCREEN_FILES,
     GUI_SCREEN_FILE_PREVIEW,
     GUI_SCREEN_NEW_FILE,
@@ -935,6 +944,146 @@ static uint64_t gui_read_tsc(void) {
     return ((uint64_t)high << 32) | low;
 }
 
+static void gui_draw_setup_option(uint32_t x, uint32_t y,
+                                  const char* title,
+                                  const char* subtitle,
+                                  uint8_t selected) {
+    if (selected) {
+        gui_rect(x, y, 720, 74, 11);
+        gui_rect_border(x, y, 720, 74, 15);
+        gui_draw_text(x + 18, y + 18, ">", 0);
+        gui_draw_text(x + 44, y + 18, title, 0);
+        gui_draw_text(x + 44, y + 42, subtitle, 0);
+    } else {
+        gui_rect(x, y, 720, 74, 7);
+        gui_rect_border(x, y, 720, 74, 0);
+        gui_draw_text(x + 44, y + 18, title, 0);
+        gui_draw_text(x + 44, y + 42, subtitle, 8);
+    }
+}
+
+static void gui_draw_setup(void) {
+    uint32_t w = gui_get_width();
+    uint32_t h = gui_get_height();
+
+    gui_clear(0);
+
+    uint32_t panel_w = 900;
+    uint32_t panel_h = 520;
+    uint32_t panel_x = (w - panel_w) / 2;
+    uint32_t panel_y = (h - panel_h) / 2;
+
+    gui_rect(panel_x, panel_y, panel_w, panel_h, 15);
+    gui_rect_border(panel_x, panel_y, panel_w, panel_h, 8);
+
+    gui_draw_text(panel_x + 40, panel_y + 40, "Welcome to Bionic Setup", 0);
+    gui_draw_text(panel_x + 40, panel_y + 70, "Choose how Bionic should use storage.", 8);
+
+    gui_draw_text(panel_x + 40, panel_y + 110, "Storage mode", 0);
+
+    gui_draw_setup_option(
+        panel_x + 80,
+        panel_y + 150,
+        "BIONICFS recommended",
+        "Internal persistent filesystem for Bionic.",
+        gui_setup_selected == 0
+    );
+
+    gui_draw_setup_option(
+        panel_x + 80,
+        panel_y + 240,
+        "FAT32 experimental",
+        "Use a standard filesystem later. Not fully implemented yet.",
+        gui_setup_selected == 1
+    );
+
+    gui_draw_setup_option(
+        panel_x + 80,
+        panel_y + 330,
+        "RAM only",
+        "Temporary session. Files are lost after reboot.",
+        gui_setup_selected == 2
+    );
+
+    gui_draw_text(panel_x + 40, panel_y + 470, "W/S move   Enter continue", 8);
+}
+
+static void gui_setup_apply(void) {
+    bionic_fs_mode_t mode = BIONIC_FS_MODE_BIONICFS;
+
+    if (gui_setup_selected == 0) {
+        mode = BIONIC_FS_MODE_BIONICFS;
+    } else if (gui_setup_selected == 1) {
+        mode = BIONIC_FS_MODE_FAT32;
+    } else {
+        mode = BIONIC_FS_MODE_RAM;
+    }
+
+    /*
+       Si no hay disco y elegimos algo persistente, forzamos RAM only.
+    */
+    if (!ata_is_present() && mode != BIONIC_FS_MODE_RAM) {
+        mode = BIONIC_FS_MODE_RAM;
+    }
+
+    if (mode != BIONIC_FS_MODE_RAM) {
+        install_config_save(mode);
+    }
+
+    /*
+       Si se instala en BIONICFS, creamos una imagen inicial vacía.
+    */
+    if (mode == BIONIC_FS_MODE_BIONICFS) {
+        bionicfs_save();
+    }
+
+    /*
+       FAT32 todavía no existe, pero dejamos la config guardada.
+       De momento no carga nada.
+    */
+    gui_setup_active = 0;
+    gui_screen = GUI_SCREEN_DESKTOP;
+
+    gui_redraw_desktop();
+}
+
+static void gui_setup_handle_key(char c) {
+    if (c == 'w' || c == 'W') {
+        if (gui_setup_selected > 0) {
+            gui_setup_selected--;
+        } else {
+            gui_setup_selected = 2;
+        }
+
+        gui_draw_setup();
+        return;
+    }
+
+    if (c == 's' || c == 'S') {
+        gui_setup_selected++;
+
+        if (gui_setup_selected > 2) {
+            gui_setup_selected = 0;
+        }
+
+        gui_draw_setup();
+        return;
+    }
+
+    if (c == '\n') {
+        gui_setup_apply();
+        return;
+    }
+}
+
+static void gui_setup_start(void) {
+    gui_setup_active = 1;
+    gui_setup_selected = 0;
+    gui_screen = GUI_SCREEN_SETUP;
+
+    gui_draw_setup();
+}
+
 static void gui_draw_desktop_background_region(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh) {
     uint32_t screen_w = gui_get_width();
     uint32_t screen_h = gui_get_height();
@@ -1067,7 +1216,12 @@ void gui_demo(void) {
 
     gui_boot_animation();
 
-    gui_redraw_desktop();
+    if (!install_config_exists()) {
+        gui_setup_start();
+    } else {
+        gui_screen = GUI_SCREEN_DESKTOP;
+        gui_redraw_desktop();
+    }
 }
 
 static void gui_draw_file_explorer(void) {
@@ -3650,7 +3804,8 @@ static void gui_terminal_execute_command(void) {
 
     if (gui_term_streq(gui_term_input, "help")) {
         gui_term_add_line("Commands:");
-        gui_term_add_line("help, clear, pwd, ls, cd, mkdir, touch, cat, write, rm, tree, exit, diskinfo, disktest, savefs, loadfs, storageinfo, autosave on/off/status");
+        gui_term_add_line("help, clear, pwd, ls, cd, mkdir, touch, cat, write, rm, tree, exit, diskinfo");
+               gui_term_add_line("disktest, savefs, loadfs, storageinfo, autosave on/off/status, installinfo, installreset");
     }
 
     else if (gui_term_streq(gui_term_input, "clear")) {
@@ -3668,6 +3823,27 @@ static void gui_terminal_execute_command(void) {
         gui_term_add_line("ATA disk detected");
     } else {
         gui_term_add_line("No ATA disk detected");
+    }
+    }
+
+    else if (gui_term_streq(gui_term_input, "installinfo")) {
+    if (install_config_exists()) {
+        install_config_load();
+
+        gui_term_add_line("Bionic installation: found");
+        gui_term_add_line(install_fs_mode_name(install_get_fs_mode()));
+    } else {
+        gui_term_add_line("Bionic installation: not found");
+    }
+}
+
+else if (gui_term_streq(gui_term_input, "installreset")) {
+    if (install_config_clear() == 0) {
+        gui_term_add_line("Formatting disk...");
+        gui_term_add_line("Install config cleared");
+        gui_term_add_line("Reboot to show setup again");
+    } else {
+        gui_term_add_line("installreset failed");
     }
 }
 
@@ -3823,14 +3999,16 @@ else if (gui_term_starts_with(gui_term_input, "touch ")) {
         }
     }
 
-        else if (gui_term_streq(gui_term_input, "autosave on")) {
+else if (gui_term_streq(gui_term_input, "autosave on")) {
     gui_autosave_enabled = 1;
     gui_term_add_line("Autosave enabled");
+    gui_term_add_line("Future changes will be saved automatically");
 }
 
 else if (gui_term_streq(gui_term_input, "autosave off")) {
     gui_autosave_enabled = 0;
     gui_term_add_line("Autosave disabled");
+    gui_term_add_line("Changes will not be saved automatically");
 }
 
 else if (gui_term_streq(gui_term_input, "autosave status")) {
@@ -3993,6 +4171,12 @@ static void gui_terminal_handle_key(char c) {
 }
 
 void gui_handle_key(char c) {
+
+    if (gui_screen == GUI_SCREEN_SETUP) {
+        gui_setup_handle_key(c);
+        return;
+    }
+
     /*
        Pantallas especiales que tienen su propio control
     */
